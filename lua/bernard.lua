@@ -1,5 +1,7 @@
 local M = {}
 
+local active = false
+
 local connections = {}
 local timer = nil
 local response = ""
@@ -12,22 +14,23 @@ local diffs = {}
 local diff_count = 10
 local ns_id = vim.api.nvim_create_namespace("bernard")
 
+vim.api.nvim_set_hl(0, "BernardSuggestion", { fg = "grey", italic = true })
+
 local function display_response(line, col)
 	vim.schedule(function()
 		vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 		local lines = vim.split(response, "\n", { trimempty = true })
 		local virtual_lines = {}
 
-		local first_line = { { "", "Comment" } }
+		local first_line = { { "", "BernardSuggestion" } }
 		for i, line_text in ipairs(lines) do
 			if i == 1 then
 				first_line[1][1] = line_text
 			else
-				table.insert(virtual_lines, { { line_text, "Comment" } })
+				table.insert(virtual_lines, { { line_text, "BernardSuggestion" } })
 			end
 		end
 
-		print(line, col)
 		vim.api.nvim_buf_set_extmark(0, ns_id, line, col, {
 			virt_lines = virtual_lines,
 			virt_text = first_line,
@@ -65,8 +68,6 @@ local function send_data(data, line, col)
 				return
 			end
 
-			print("Sent data:", data)
-
 			client:read_start(function(read_err, chunk)
 				if read_err then
 					print("Read error: " .. read_err)
@@ -78,8 +79,6 @@ local function send_data(data, line, col)
 				end
 
 				if chunk then
-					print("Received response:", chunk)
-
 					chunk = string.gsub(chunk, "\\n", "\n")
 					chunk = string.gsub(chunk, "\\t", "\t")
 					chunk = string.gsub(chunk, "\\r", "\r")
@@ -100,10 +99,8 @@ local function send_data(data, line, col)
 		end)
 	end)
 
-	-- Set a timeout
 	local timeout_timer = uv.new_timer()
 	timeout_timer:start(5000, 0, function()
-		print("Request timed out")
 		if not client:is_closing() then
 			client:close()
 		end
@@ -181,6 +178,18 @@ function M.setup(opts)
 	end, {
 		nargs = "?",
 	})
+
+	vim.api.nvim_create_user_command("Bernard", function(o)
+		if o.args == "disable" then
+			M.disable()
+		end
+	end, {
+		nargs = "?",
+	})
+
+	if opts.startup then
+		M.enable()
+	end
 end
 
 function M.handle_tab()
@@ -195,7 +204,10 @@ end
 function M.enable()
 	vim.api.nvim_create_autocmd({ "CursorMovedI" }, {
 		callback = function()
-			print("input cursor moved")
+			if not active then
+				return
+			end
+
 			vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 
 			local cursor = vim.api.nvim_win_get_cursor(0)
@@ -240,6 +252,10 @@ function M.enable()
 
 	vim.api.nvim_create_autocmd("CursorMoved", {
 		callback = function()
+			if not active then
+				return
+			end
+
 			response = ""
 			vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 		end,
@@ -249,16 +265,20 @@ function M.enable()
 	local success = vim.api.nvim_buf_attach(0, false, {
 		on_bytes = on_bytes,
 	})
+
 	if success then
-		print("Successfully attached to buffer " .. vim.api.nvim_get_current_buf())
 		open_buffers[vim.api.nvim_get_current_buf()] = true
 	else
-		print("Failed to attach to buffer " .. vim.api.nvim_get_current_buf())
+		print("Failed to attach Bernard to buffer " .. vim.api.nvim_get_current_buf())
 	end
 
 	vim.api.nvim_create_autocmd("BufAdd", {
 		pattern = "*",
 		callback = function()
+			if not active then
+				return
+			end
+
 			vim.keymap.set("i", "<Tab>", M.handle_tab, { noremap = true, silent = true })
 
 			local current_buffer = vim.api.nvim_get_current_buf()
@@ -266,14 +286,14 @@ function M.enable()
 				return
 			end
 
-			local success = vim.api.nvim_buf_attach(0, false, {
+			success = vim.api.nvim_buf_attach(0, false, {
 				on_bytes = on_bytes,
 			})
+
 			if success then
-				print("Successfully attached to buffer " .. vim.api.nvim_get_current_buf())
 				open_buffers[vim.api.nvim_get_current_buf()] = true
 			else
-				print("Failed to attach to buffer " .. vim.api.nvim_get_current_buf())
+				print("Failed to attach Bernard to buffer " .. vim.api.nvim_get_current_buf())
 			end
 		end,
 	})
@@ -281,9 +301,19 @@ function M.enable()
 	vim.api.nvim_create_autocmd("BufDelete", {
 		pattern = "*",
 		callback = function()
+			if not active then
+				return
+			end
+
 			open_buffers[vim.api.nvim_get_current_buf()] = nil
 		end,
 	})
+
+	active = true
+end
+
+function M.disable()
+	active = false
 end
 
 return M
