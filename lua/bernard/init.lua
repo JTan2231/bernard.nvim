@@ -7,14 +7,13 @@ local timer = nil
 local response = ""
 local host = ""
 local port = 0
+local suggestion_delay = 750
 
 local open_buffers = {}
 local diffs = {}
 
-local diff_count = 10
+local diff_count = 20
 local ns_id = vim.api.nvim_create_namespace("bernard")
-
-vim.api.nvim_set_hl(0, "BernardSuggestion", { fg = "grey", italic = true })
 
 local function display_response(line, col)
 	vim.schedule(function()
@@ -55,6 +54,7 @@ local function send_data(data, line, col)
 
 	local client = uv.new_tcp()
 	table.insert(connections, client)
+	local suggestion = ""
 	client:connect(host, port, function(err)
 		if err then
 			print("Connection error: " .. err)
@@ -83,14 +83,20 @@ local function send_data(data, line, col)
 					chunk = string.gsub(chunk, "\\t", "\t")
 					chunk = string.gsub(chunk, "\\r", "\r")
 
-					response = response .. chunk
+					suggestion = suggestion .. chunk
 				else
 					if not client:is_closing() then
 						client:close()
 					end
 
+					if not timer then
+						response = ""
+						return
+					end
+
 					vim.schedule(function()
-						response = vim.fn.substitute(response, "\\s*$", "", "")
+						response = vim.fn.substitute(suggestion, "\\s*$", "", "")
+						table.remove(connections, 1)
 
 						display_response(line, col)
 					end)
@@ -116,6 +122,10 @@ local function on_bytes(_, bufnr, _, start_row, _, _, _, _, _, new_end_row, _, _
 
 	local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + new_end_row, false)
 	local text = table.concat(lines, "\n")
+
+	if #text == 0 then
+		return
+	end
 
 	local filename = vim.fn.expand("%:p")
 
@@ -154,6 +164,18 @@ local function build_request(cursor)
 	return vim.fn.json_encode(request)
 end
 
+local function cleanup()
+	if timer then
+		timer:stop()
+		if not timer:is_closing() then
+			timer:close()
+		end
+	end
+
+	response = ""
+	vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
+end
+
 function M.insert_response()
 	if response == "" then
 		return
@@ -166,38 +188,11 @@ function M.insert_response()
 	response = ""
 end
 
-function M.setup(opts)
-	opts = opts or {}
-	host = opts.host or "127.0.0.1"
-	port = opts.port or 5050
-
-	vim.api.nvim_create_user_command("Bernard", function(o)
-		if o.args == "enable" then
-			M.enable()
-		end
-	end, {
-		nargs = "?",
-	})
-
-	vim.api.nvim_create_user_command("Bernard", function(o)
-		if o.args == "disable" then
-			M.disable()
-		end
-	end, {
-		nargs = "?",
-	})
-
-	if opts.startup then
-		M.enable()
-	end
-end
-
 function M.handle_tab()
-	vim.notify("tab pressed: " .. tostring(#response))
-	if #response > 0 then
+	if #response > 0 and #connections == 0 then
 		M.insert_response()
 	else
-		vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, true, true), "i", true)
+		vim.api.nvim_put({ "\t" }, "", false, true)
 	end
 end
 
@@ -208,22 +203,15 @@ function M.enable()
 				return
 			end
 
-			vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
+			cleanup()
 
 			local cursor = vim.api.nvim_win_get_cursor(0)
 			local col = cursor[2]
 
 			local current_line = vim.fn.getline(".")
-			if col >= #current_line - 2 then
-				if timer then
-					timer:stop()
-					if not timer:is_closing() then
-						timer:close()
-					end
-				end
-
+			if col >= #current_line - 2 and #diffs > 0 then
 				timer = uv.new_timer()
-				timer:start(500, 0, function()
+				timer:start(suggestion_delay, 0, function()
 					vim.schedule(function()
 						local cursor = vim.api.nvim_win_get_cursor(0)
 						local row = cursor[1]
@@ -256,45 +244,44 @@ function M.enable()
 				return
 			end
 
-			response = ""
-			vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
+			cleanup()
 		end,
 	})
 
-	vim.keymap.set("i", "<Tab>", M.handle_tab, { noremap = true, silent = true })
-	local success = vim.api.nvim_buf_attach(0, false, {
-		on_bytes = on_bytes,
-	})
-
-	if success then
-		open_buffers[vim.api.nvim_get_current_buf()] = true
-	else
-		print("Failed to attach Bernard to buffer " .. vim.api.nvim_get_current_buf())
-	end
-
-	vim.api.nvim_create_autocmd("BufAdd", {
+	vim.api.nvim_create_autocmd("BufEnter", {
 		pattern = "*",
 		callback = function()
 			if not active then
 				return
 			end
 
-			vim.keymap.set("i", "<Tab>", M.handle_tab, { noremap = true, silent = true })
-
 			local current_buffer = vim.api.nvim_get_current_buf()
 			if open_buffers[current_buffer] then
 				return
 			end
 
-			success = vim.api.nvim_buf_attach(0, false, {
+			vim.keymap.set("i", "<Tab>", M.handle_tab, { noremap = true, silent = true })
+
+			local success = vim.api.nvim_buf_attach(0, false, {
 				on_bytes = on_bytes,
 			})
 
 			if success then
-				open_buffers[vim.api.nvim_get_current_buf()] = true
+				open_buffers[current_buffer] = true
 			else
 				print("Failed to attach Bernard to buffer " .. vim.api.nvim_get_current_buf())
 			end
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("InsertLeave", {
+		callback = cleanup,
+	})
+
+	vim.api.nvim_create_autocmd("ColorScheme", {
+		pattern = "*",
+		callback = function()
+			vim.api.nvim_set_hl(0, "BernardSuggestion", { fg = "#8a8a8a", ctermfg = 200, force = true })
 		end,
 	})
 
@@ -310,10 +297,33 @@ function M.enable()
 	})
 
 	active = true
+	print("Bernard enabled")
 end
 
 function M.disable()
 	active = false
+	print("Bernard disabled")
+end
+
+function M.setup(opts)
+	opts = opts or {}
+	host = opts.host or "127.0.0.1"
+	port = opts.port or 5050
+	suggestion_delay = opts.suggestion_delay or 750
+
+	vim.api.nvim_create_user_command("Bernard", function(o)
+		if o.args == "enable" then
+			M.enable()
+		elseif o.args == "disable" then
+			M.disable()
+		end
+	end, {
+		nargs = "?",
+	})
+
+	if opts.startup then
+		M.enable()
+	end
 end
 
 return M
