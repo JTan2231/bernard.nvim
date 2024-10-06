@@ -10,10 +10,23 @@ local port = 0
 local suggestion_delay = 750
 
 local open_buffers = {}
-local diffs = {}
+local diff_queue = {}
+local diff_lines = {}
 
-local diff_count = 20
+local context_window = 20
 local ns_id = vim.api.nvim_create_namespace("bernard")
+
+local function print_table(t, indent)
+	indent = indent or ""
+	for k, v in pairs(t) do
+		if type(v) == "table" then
+			print(indent .. tostring(k) .. ":")
+			print_table(v, indent .. "  ")
+		else
+			print(indent .. tostring(k) .. ": " .. tostring(v))
+		end
+	end
+end
 
 local function display_response(line, col)
 	vim.schedule(function()
@@ -116,23 +129,46 @@ local function send_data(data, line, col)
 end
 
 local function on_bytes(_, bufnr, _, start_row, _, _, _, _, _, new_end_row, _, _)
-	while #diffs >= diff_count do
-		table.remove(diffs, 1)
-	end
-
-	local lines = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + new_end_row, false)
-	local text = table.concat(lines, "\n")
-
-	if #text == 0 then
-		return
+	while #diff_queue > math.max(0, context_window - new_end_row) do
+		table.remove(diff_queue, 1)
 	end
 
 	local filename = vim.fn.expand("%:p")
+	for i = start_row, start_row + new_end_row + 1 do
+		diff_lines[i] = {
+			filename = filename,
+			text = vim.api.nvim_buf_get_lines(bufnr, i, i + 1, false)[1],
+		}
 
-	table.insert(diffs, { filename = filename, text = text })
+		local contains = false
+		for _, v in ipairs(diff_queue) do
+			if v == i then
+				contains = true
+				break
+			end
+		end
+
+		if not contains then
+			table.insert(diff_queue, i)
+		end
+	end
 end
 
 local function build_request(cursor)
+	local sorted_queue = {}
+	for _, line in ipairs(diff_queue) do
+		table.insert(sorted_queue, line)
+	end
+
+	table.sort(sorted_queue, function(a, b)
+		return a < b
+	end)
+
+	local diffs = {}
+	for _, line in ipairs(sorted_queue) do
+		table.insert(diffs, diff_lines[line])
+	end
+
 	local diff_map = {}
 	for _, diff in ipairs(diffs) do
 		local filename = diff.filename
@@ -152,7 +188,7 @@ local function build_request(cursor)
 	end
 
 	local start_line = math.max(1, cursor.line - 10)
-	local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), start_line, cursor.line + 1, false)
+	local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), start_line, cursor.line, false)
 	local cursor_context = table.concat(lines, "\n")
 
 	local request = {
@@ -181,8 +217,46 @@ function M.insert_response()
 		return
 	end
 
-	local lines = vim.split(response, "\n", { trimempty = false })
-	vim.api.nvim_put(lines, "c", true, true)
+	-- -1 here because the LSP apply_text_edits function is 0-indexed
+	local line_start = vim.fn.line(".") - 1
+	local col_start = vim.fn.col(".") - 1
+	local range = {
+		start = { line = line_start, character = col_start },
+		["end"] = { line = line_start, character = col_start },
+	}
+
+	local bufnr = vim.api.nvim_get_current_buf()
+	for c in response:gmatch(".") do
+		local line = vim.fn.getline(range["end"].line + 1) -- +1 because this is 1-indexed
+		local buffer_char = line:sub(range["end"].character + 1, range["end"].character + 1)
+		print("comparing", c, "and", buffer_char)
+		if c == buffer_char then
+			if c == "\n" then
+				range["end"].line = range["end"].line + 1
+				range["end"].character = 0
+			else
+				range["end"].character = range["end"].character + 1
+			end
+		end
+
+		if c == "\n" then
+			line_start = line_start + 1
+			col_start = 0
+		else
+			col_start = col_start + 1
+		end
+	end
+
+	print_table(range, "")
+
+	vim.lsp.util.apply_text_edits({
+		{
+			range = range,
+			newText = response,
+		},
+	}, bufnr, "utf-16")
+
+	vim.fn.cursor(line_start + 1, col_start + 1)
 
 	vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 	response = ""
@@ -190,9 +264,10 @@ end
 
 function M.handle_tab()
 	if #response > 0 and #connections == 0 then
-		M.insert_response()
+		vim.schedule(M.insert_response)
+		return ""
 	else
-		vim.api.nvim_put({ "\t" }, "", false, true)
+		return vim.api.nvim_replace_termcodes("<Tab>", true, true, true)
 	end
 end
 
@@ -209,7 +284,7 @@ function M.enable()
 			local col = cursor[2]
 
 			local current_line = vim.fn.getline(".")
-			if col >= #current_line - 2 and #diffs > 0 then
+			if col >= #current_line - 2 and #diff_queue > 0 then
 				timer = uv.new_timer()
 				timer:start(suggestion_delay, 0, function()
 					vim.schedule(function()
@@ -260,7 +335,9 @@ function M.enable()
 				return
 			end
 
-			vim.keymap.set("i", "<Tab>", M.handle_tab, { noremap = true, silent = true })
+			vim.keymap.set("i", "<Tab>", function()
+				return M.handle_tab()
+			end, { expr = true, noremap = true, silent = true })
 
 			local success = vim.api.nvim_buf_attach(0, false, {
 				on_bytes = on_bytes,
@@ -309,7 +386,8 @@ function M.setup(opts)
 	opts = opts or {}
 	host = opts.host or "127.0.0.1"
 	port = opts.port or 5050
-	suggestion_delay = opts.suggestion_delay or 750
+	suggestion_delay = opts.suggestion_delay or suggestion_delay
+	context_window = opts.context_window or context_window
 
 	vim.api.nvim_create_user_command("Bernard", function(o)
 		if o.args == "enable" then
