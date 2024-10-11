@@ -16,18 +16,6 @@ local diff_lines = {}
 local context_window = 20
 local ns_id = vim.api.nvim_create_namespace("bernard")
 
-local function print_table(t, indent)
-	indent = indent or ""
-	for k, v in pairs(t) do
-		if type(v) == "table" then
-			print(indent .. tostring(k) .. ":")
-			print_table(v, indent .. "  ")
-		else
-			print(indent .. tostring(k) .. ": " .. tostring(v))
-		end
-	end
-end
-
 local function display_response(line, col)
 	vim.schedule(function()
 		vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
@@ -137,6 +125,7 @@ local function on_bytes(_, bufnr, _, start_row, _, _, _, _, _, new_end_row, _, _
 	for i = start_row, start_row + new_end_row + 1 do
 		diff_lines[i] = {
 			filename = filename,
+			line = i,
 			text = vim.api.nvim_buf_get_lines(bufnr, i, i + 1, false)[1],
 		}
 
@@ -189,6 +178,10 @@ local function build_request(cursor)
 
 	local start_line = math.max(1, cursor.line - 10)
 	local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), start_line, cursor.line, false)
+	for i, line in ipairs(lines) do
+		lines[i] = string.format("%d %s", cursor.line - 10 + i, line)
+	end
+
 	local cursor_context = table.concat(lines, "\n")
 
 	local request = {
@@ -208,8 +201,41 @@ local function cleanup()
 		end
 	end
 
+	while #connections > 0 do
+		local connection = table.remove(connections)
+		if not connection:is_closing() then
+			connection:close()
+		end
+	end
+
 	response = ""
 	vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
+end
+
+local function setup_timer_request()
+	timer = uv.new_timer()
+	timer:start(suggestion_delay, 0, function()
+		vim.schedule(function()
+			local cursor = vim.api.nvim_win_get_cursor(0)
+			local row = cursor[1]
+			local col = cursor[2]
+			cursor = {
+				line = row,
+				column = col,
+				flat = vim.fn.line2byte(row) + col - 1,
+				filename = vim.fn.expand("%:p"),
+			}
+
+			local request = build_request(cursor)
+			send_data(request, cursor.line - 1, cursor.column)
+		end)
+		timer:close()
+	end)
+end
+
+function M.manual_prompt()
+	cleanup()
+	setup_timer_request()
 end
 
 function M.insert_response()
@@ -247,8 +273,6 @@ function M.insert_response()
 		end
 	end
 
-	print_table(range, "")
-
 	vim.lsp.util.apply_text_edits({
 		{
 			range = range,
@@ -271,7 +295,8 @@ function M.handle_tab()
 	end
 end
 
-function M.enable()
+function M.enable(opts)
+	opts = opts or {}
 	vim.api.nvim_create_autocmd({ "CursorMovedI" }, {
 		callback = function()
 			if not active then
@@ -280,34 +305,18 @@ function M.enable()
 
 			cleanup()
 
-			local cursor = vim.api.nvim_win_get_cursor(0)
-			local col = cursor[2]
+			if opts.auto_prompt then
+				local cursor = vim.api.nvim_win_get_cursor(0)
+				local col = cursor[2]
 
-			local current_line = vim.fn.getline(".")
-			if col >= #current_line - 2 and #diff_queue > 0 then
-				timer = uv.new_timer()
-				timer:start(suggestion_delay, 0, function()
-					vim.schedule(function()
-						local cursor = vim.api.nvim_win_get_cursor(0)
-						local row = cursor[1]
-						local col = cursor[2]
-						cursor = {
-							line = row,
-							column = col,
-							flat = vim.fn.line2byte(row) + col - 1,
-							filename = vim.fn.expand("%:p"),
-						}
-
-						local request = build_request(cursor)
-
-						send_data(request, cursor.line - 1, cursor.column)
-					end)
-					timer:close()
-				end)
-			else
-				if timer and not timer:is_closing() then
-					timer:stop()
-					timer:close()
+				local current_line = vim.fn.getline(".")
+				if col >= #current_line and #diff_queue > 0 then
+					setup_timer_request()
+				else
+					if timer and not timer:is_closing() then
+						timer:stop()
+						timer:close()
+					end
 				end
 			end
 		end,
@@ -373,6 +382,14 @@ function M.enable()
 		end,
 	})
 
+	local default = "<C-k>"
+	local prompt_mapping = vim.fn.maparg(default, "i", false, true)
+	if opts.manual_prompt_override or not (prompt_mapping and (prompt_mapping.lhs or prompt_mapping.callback)) then
+		vim.keymap.set("i", opts.manual_prompt_override or default, function()
+			M.manual_prompt()
+		end, { noremap = true, silent = false })
+	end
+
 	active = true
 	print("Bernard enabled")
 end
@@ -400,7 +417,7 @@ function M.setup(opts)
 	})
 
 	if opts.startup then
-		M.enable()
+		M.enable(opts)
 	end
 end
 
