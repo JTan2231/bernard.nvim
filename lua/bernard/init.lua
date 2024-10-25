@@ -9,6 +9,9 @@ local host = ""
 local port = 0
 local suggestion_delay = 750
 
+local analysis_lock = false
+local analysis_range = nil
+
 local open_buffers = {}
 local diff_queue = {}
 local diff_lines = {}
@@ -16,7 +19,7 @@ local diff_lines = {}
 local context_window = 20
 local ns_id = vim.api.nvim_create_namespace("bernard")
 
-local function display_response(line, col)
+local function display_response(line, col, text_pos)
 	vim.schedule(function()
 		vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 		local lines = vim.split(response, "\n", { trimempty = true })
@@ -31,16 +34,22 @@ local function display_response(line, col)
 			end
 		end
 
-		vim.api.nvim_buf_set_extmark(0, ns_id, line, col, {
+		local opts = {
 			virt_lines = virtual_lines,
 			virt_text = first_line,
-			virt_text_pos = "inline",
-		})
+			virt_text_pos = text_pos,
+		}
+
+		if text_pos == "eol" then
+			opts.virt_text_win_col = 0
+		end
+
+		vim.api.nvim_buf_set_extmark(0, ns_id, line, col, opts)
 	end)
 end
 
 local uv = vim.loop
-local function send_data(data, line, col)
+local function send_data(data, display_callback)
 	response = ""
 
 	if #connections > 0 then
@@ -53,8 +62,18 @@ local function send_data(data, line, col)
 		connections = {}
 	end
 
+	-- big endian
+	local data_size = string.char(
+		bit.band(bit.rshift(#data, 24), 0xFF),
+		bit.band(bit.rshift(#data, 16), 0xFF),
+		bit.band(bit.rshift(#data, 8), 0xFF),
+		bit.band(#data, 0xFF)
+	)
+
 	local client = uv.new_tcp()
 	table.insert(connections, client)
+	-- in-progress building of the response
+	-- final version of the response is held in the global variable
 	local suggestion = ""
 	client:connect(host, port, function(err)
 		if err then
@@ -62,52 +81,57 @@ local function send_data(data, line, col)
 			return
 		end
 
-		client:write(data, function(write_err)
+		client:write(data_size, function(write_err)
 			if write_err then
 				print("Write error: " .. write_err)
 				client:close()
 				return
 			end
 
-			client:read_start(function(read_err, chunk)
-				if read_err then
-					print("Read error: " .. read_err)
-					if not client:is_closing() then
-						client:close()
-					end
-
+			client:write(data, function(write_err)
+				if write_err then
+					print("Write error: " .. write_err)
+					client:close()
 					return
 				end
 
-				if chunk then
-					chunk = string.gsub(chunk, "\\n", "\n")
-					chunk = string.gsub(chunk, "\\t", "\t")
-					chunk = string.gsub(chunk, "\\r", "\r")
+				client:read_start(function(read_err, chunk)
+					if read_err then
+						print("Read error: " .. read_err)
+						if not client:is_closing() then
+							client:close()
+						end
 
-					suggestion = suggestion .. chunk
-				else
-					if not client:is_closing() then
-						client:close()
-					end
-
-					if not timer then
-						response = ""
 						return
 					end
 
-					vim.schedule(function()
-						response = vim.fn.substitute(suggestion, "\\s*$", "", "")
-						table.remove(connections, 1)
+					if chunk then
+						chunk = string.gsub(chunk, "\\n", "\n")
+						chunk = string.gsub(chunk, "\\t", "\t")
+						chunk = string.gsub(chunk, "\\r", "\r")
+						chunk = string.gsub(chunk, "\\\\", "\\")
 
-						display_response(line, col)
-					end)
-				end
+						suggestion = suggestion .. chunk
+					else
+						if not client:is_closing() then
+							client:close()
+						end
+
+						vim.schedule(function()
+							response = vim.fn.substitute(suggestion, "\\s*$", "", "")
+							table.remove(connections, 1)
+
+							display_callback()
+						end)
+					end
+				end)
 			end)
 		end)
 	end)
 
 	local timeout_timer = uv.new_timer()
-	timeout_timer:start(5000, 0, function()
+	timeout_timer:start(20000, 0, function()
+		print("timing out timer")
 		if not client:is_closing() then
 			client:close()
 		end
@@ -143,7 +167,13 @@ local function on_bytes(_, bufnr, _, start_row, _, _, _, _, _, new_end_row, _, _
 	end
 end
 
-local function build_request(cursor)
+local function get_suggestion_display_callback(line, col)
+	return function()
+		display_response(line, col, "inline")
+	end
+end
+
+local function build_suggestion_request(cursor)
 	local sorted_queue = {}
 	for _, line in ipairs(diff_queue) do
 		table.insert(sorted_queue, line)
@@ -165,7 +195,7 @@ local function build_request(cursor)
 			diff_map[filename] = {}
 		end
 
-		table.insert(diff_map[filename], { delta = diff.text, diff_type = "addition" })
+		table.insert(diff_map[filename], { delta = diff.text, line = diff.line, diff_type = "Addition" })
 	end
 
 	local changes = {}
@@ -190,10 +220,60 @@ local function build_request(cursor)
 		cursor_context = cursor_context,
 	}
 
+	request = {
+		method = "Completion",
+		body = vim.fn.json_encode(request),
+	}
+
+	return vim.fn.json_encode(request)
+end
+
+local function build_analysis_request(user_query)
+	local reg_save = vim.fn.getreg('"')
+	local regtype_save = vim.fn.getregtype('"')
+	local cb_save = vim.opt.clipboard:get()
+
+	local range_start = vim.fn.getpos("'<")
+	local range_end = vim.fn.getpos("'>")
+
+	print("range start", vim.inspect(range_start))
+	print("range end", vim.inspect(range_end))
+
+	analysis_range = {
+		start = { line = range_start[2], character = range_start[3] },
+		["end"] = { line = range_end[2], character = range_end[3] },
+	}
+
+	local start = range_start[4]
+	local end_pos = range_end[4]
+
+	vim.cmd("normal! gvy")
+
+	local selection = vim.fn.getreg('"')
+
+	vim.fn.setreg('"', reg_save, regtype_save)
+	vim.opt.clipboard = cb_save
+
+	local request = {
+		user_query,
+		body = selection,
+		byte_start = start,
+		byte_end = end_pos,
+	}
+
+	request = {
+		method = "Analysis",
+		body = vim.fn.json_encode(request),
+	}
+
 	return vim.fn.json_encode(request)
 end
 
 local function cleanup()
+	if analysis_lock then
+		return
+	end
+
 	if timer then
 		timer:stop()
 		if not timer:is_closing() then
@@ -210,32 +290,49 @@ local function cleanup()
 
 	response = ""
 	vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
+	analysis_range = nil
 end
 
-local function setup_timer_request()
+local function get_suggestion()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local row = cursor[1]
+	local col = cursor[2]
+	cursor = {
+		line = row,
+		column = col,
+		flat = vim.fn.line2byte(row) + col - 1,
+		filename = vim.fn.expand("%:p"),
+	}
+
+	local request = build_suggestion_request(cursor)
+	send_data(request, get_suggestion_display_callback(cursor.line - 1, cursor.column))
+end
+
+local function get_analysis(user_query)
+	local request = build_analysis_request(user_query)
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	analysis_lock = true
+	send_data(request, function()
+		if response == "<NOP>" then
+			return
+		end
+
+		display_response(cursor[1] - 1, cursor[2], "overlay")
+		analysis_lock = false
+	end)
+end
+
+local function setup_timer_request(function_name)
 	timer = uv.new_timer()
 	timer:start(suggestion_delay, 0, function()
-		vim.schedule(function()
-			local cursor = vim.api.nvim_win_get_cursor(0)
-			local row = cursor[1]
-			local col = cursor[2]
-			cursor = {
-				line = row,
-				column = col,
-				flat = vim.fn.line2byte(row) + col - 1,
-				filename = vim.fn.expand("%:p"),
-			}
-
-			local request = build_request(cursor)
-			send_data(request, cursor.line - 1, cursor.column)
-		end)
+		vim.schedule(function_name)
 		timer:close()
 	end)
 end
 
 function M.manual_prompt()
 	cleanup()
-	setup_timer_request()
+	setup_timer_request(get_suggestion)
 end
 
 function M.insert_response()
@@ -243,35 +340,47 @@ function M.insert_response()
 		return
 	end
 
-	-- -1 here because the LSP apply_text_edits function is 0-indexed
-	local line_start = vim.fn.line(".") - 1
-	local col_start = vim.fn.col(".") - 1
-	local range = {
-		start = { line = line_start, character = col_start },
-		["end"] = { line = line_start, character = col_start },
-	}
-
 	local bufnr = vim.api.nvim_get_current_buf()
-	for c in response:gmatch(".") do
-		local line = vim.fn.getline(range["end"].line + 1) -- +1 because this is 1-indexed
-		local buffer_char = line:sub(range["end"].character + 1, range["end"].character + 1)
-		print("comparing", c, "and", buffer_char)
-		if c == buffer_char then
+
+	local range = analysis_range
+	-- if analysis range is nil then this is a completion request
+	if not range then
+		-- -1 here because the LSP apply_text_edits function is 0-indexed
+		local line_start = vim.fn.line(".") - 1
+		local col_start = vim.fn.col(".") - 1
+
+		range = {
+			start = { line = line_start, character = col_start },
+			["end"] = { line = line_start, character = col_start },
+		}
+
+		for c in response:gmatch(".") do
+			local line = vim.fn.getline(range["end"].line + 1) -- +1 because this is 1-indexed
+			local buffer_char = line:sub(range["end"].character + 1, range["end"].character + 1)
+			if c == buffer_char then
+				if c == "\n" then
+					range["end"].line = range["end"].line + 1
+					range["end"].character = 0
+				else
+					range["end"].character = range["end"].character + 1
+				end
+			end
+
 			if c == "\n" then
-				range["end"].line = range["end"].line + 1
-				range["end"].character = 0
+				line_start = line_start + 1
+				col_start = 0
 			else
-				range["end"].character = range["end"].character + 1
+				col_start = col_start + 1
 			end
 		end
-
-		if c == "\n" then
-			line_start = line_start + 1
-			col_start = 0
-		else
-			col_start = col_start + 1
-		end
+	else
+		range.start.line = range.start.line - 1
+		range.start.character = range.start.character - 1
+		range["end"].line = range["end"].line - 1
+		range["end"].character = range["end"].character - 1
 	end
+
+	print("editing range", vim.inspect(range))
 
 	vim.lsp.util.apply_text_edits({
 		{
@@ -280,10 +389,11 @@ function M.insert_response()
 		},
 	}, bufnr, "utf-16")
 
-	vim.fn.cursor(line_start + 1, col_start + 1)
+	vim.fn.cursor(range["end"].line + 1, range["end"].character + 1)
 
 	vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
 	response = ""
+	analysis_range = nil
 end
 
 function M.handle_tab()
@@ -311,7 +421,7 @@ function M.enable(opts)
 
 				local current_line = vim.fn.getline(".")
 				if col >= #current_line and #diff_queue > 0 then
-					setup_timer_request()
+					setup_timer_request(get_suggestion)
 				else
 					if timer and not timer:is_closing() then
 						timer:stop()
@@ -319,16 +429,6 @@ function M.enable(opts)
 					end
 				end
 			end
-		end,
-	})
-
-	vim.api.nvim_create_autocmd("CursorMoved", {
-		callback = function()
-			if not active then
-				return
-			end
-
-			cleanup()
 		end,
 	})
 
@@ -344,7 +444,7 @@ function M.enable(opts)
 				return
 			end
 
-			vim.keymap.set("i", "<Tab>", function()
+			vim.keymap.set({ "i", "n" }, "<Tab>", function()
 				return M.handle_tab()
 			end, { expr = true, noremap = true, silent = true })
 
@@ -357,6 +457,16 @@ function M.enable(opts)
 			else
 				print("Failed to attach Bernard to buffer " .. vim.api.nvim_get_current_buf())
 			end
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("CursorMoved", {
+		callback = function()
+			if not active then
+				return
+			end
+
+			cleanup()
 		end,
 	})
 
@@ -389,6 +499,10 @@ function M.enable(opts)
 			M.manual_prompt()
 		end, { noremap = true, silent = false })
 	end
+
+	vim.api.nvim_create_user_command("Analyze", function(opts)
+		get_analysis(opts.args)
+	end, { range = true, nargs = "?" })
 
 	active = true
 	print("Bernard enabled")
