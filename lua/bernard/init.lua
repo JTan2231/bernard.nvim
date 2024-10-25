@@ -131,7 +131,6 @@ local function send_data(data, display_callback)
 
 	local timeout_timer = uv.new_timer()
 	timeout_timer:start(20000, 0, function()
-		print("timing out timer")
 		if not client:is_closing() then
 			client:close()
 		end
@@ -236,9 +235,6 @@ local function build_analysis_request(user_query)
 	local range_start = vim.fn.getpos("'<")
 	local range_end = vim.fn.getpos("'>")
 
-	print("range start", vim.inspect(range_start))
-	print("range end", vim.inspect(range_end))
-
 	analysis_range = {
 		start = { line = range_start[2], character = range_start[3] },
 		["end"] = { line = range_end[2], character = range_end[3] },
@@ -255,7 +251,7 @@ local function build_analysis_request(user_query)
 	vim.opt.clipboard = cb_save
 
 	local request = {
-		user_query,
+		user_query = user_query,
 		body = selection,
 		byte_start = start,
 		byte_end = end_pos,
@@ -379,8 +375,6 @@ function M.insert_response()
 		range["end"].line = range["end"].line - 1
 		range["end"].character = range["end"].character - 1
 	end
-
-	print("editing range", vim.inspect(range))
 
 	vim.lsp.util.apply_text_edits({
 		{
